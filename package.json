@@ -1,0 +1,26 @@
+{
+  "name": "pi-pkg-autoreload",
+  "version": "1.0.0",
+  "description": "pi extension: /reload git-pulls packages before reloading so remote updates land",
+  "keywords": ["pi-package", "pi-extension", "reload", "git", "packages"],
+  "license": "MIT",
+  "author": "David Raistrick",
+  "homepage": "https://github.com/keen99/pi-pkg-autoreload",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/keen99/pi-pkg-autoreload.git"
+  },
+  "type": "module",
+  "main": "./index.ts",
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "echo 'nothing to build'",
+    "check": "echo 'nothing to check'"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
