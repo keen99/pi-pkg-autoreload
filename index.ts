@@ -139,6 +139,11 @@ function patch(): void {
   };
   const original = proto.handleReloadCommand;
   if (typeof original !== "function") return;
+  // Guard against re-patching across reloads. jiti re-evaluates this module
+  // on every /reload (moduleCache:false), resetting the module-scoped
+  // `patched` flag. But the InteractiveMode prototype is shared (cached
+  // ESM instance), so without a marker we'd wrap N times after N reloads.
+  if ((original as any).__piPkgAutoreload) return;
 
   // Spawn git pull non-blocking with hard timeout. execSync blocks TUI render
   // loop; a single hung repo (auth prompt, network) freezes pi indefinitely.
@@ -230,6 +235,7 @@ function patch(): void {
     // Now reload as normal — files on disk include any pulled updates.
     return original.call(this);
   };
+  (proto.handleReloadCommand as any).__piPkgAutoreload = true;
   patched = true;
 }
 
