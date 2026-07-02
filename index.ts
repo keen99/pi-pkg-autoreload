@@ -1,87 +1,25 @@
-/**
- * pi-pkg-autoreload
- *
- * Monkeypatches pi's InteractiveMode.handleReloadCommand to git-pull all
- * configured git packages BEFORE reloading. So /reload actually picks up
- * remote changes without a manual `pi update` or `git pull` step.
- *
- * Problem: pi's /reload only rereads files from disk. For git packages that
- * means it picks up whatever is in ~/.pi/agent/git/<owner>/<repo>/, NOT the
- * latest remote. After `git push`, a /reload in a live session silently does
- * nothing — you must exit, `pi update`, relaunch. That is the "extra step"
- * friction for every git package.
- *
- * Local extensions don't have this problem because edits land directly on disk.
- * This extension closes the gap so git packages behave the same way on reload.
- *
- * How: import InteractiveMode from the installed dist, save its
- * handleReloadCommand prototype method, replace with a wrapper that:
- *   1. collects git packages from settings.json (user + project scopes)
- *   2. runs `git pull` in each package dir (best-effort, errors notified)
- *   3. calls the original handleReloadCommand()
- *
- * Scope: interactive mode only (that's where /reload lives). No effect in
- * print/rpc modes.
- *
- * Zero config.
- */
-
+import { readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readFileSync, existsSync } from "fs";
-import { homedir } from "os";
-import { dirname, join } from "path";
-import { fileURLToPath } from "url";
-import { createRequire } from "module";
-
-// Resolve InteractiveMode module from the GLOBAL pi install — not the
-// extension's own node_modules. Patching the local peerDep copy does nothing
-// because pi runtime uses the global module object. Module identity matters:
-// prototype patch must land on the same class object pi actually instantiates.
-//
-// Strategy: resolve via `npm root -g` (sync, no deps). Falls back to walking up
-// from this file's node_modules chain (dev/link scenarios).
-const here = dirname(fileURLToPath(import.meta.url));
-
-const require = createRequire(import.meta.url);
 
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 const GIT_PKGS_DIR = join(AGENT_DIR, "git");
 
-function resolveGlobalPiRoot(): string | undefined {
-  // 1. npm root -g (most reliable for global installs)
+const piRoot = (function (): string {
   try {
-    const { execSync } = require("child_process") as typeof import("child_process");
-    const npmRoot = execSync("npm root -g", { encoding: "utf-8" }).trim();
-    const candidate = join(npmRoot, "@earendil-works", "pi-coding-agent");
-    const imExists = existsSync(join(candidate, "dist", "modes", "interactive", "interactive-mode.js"));
-    if (imExists) return candidate;
+    return require.resolve("@earendil-works/pi-coding-agent/package.json")
+      .replace(/\/package\.json$/, "");
   } catch {
-    /* fall through */
+    const main = require.resolve("@earendil-works/pi-coding-agent");
+    return main.replace(/\/dist\/.*$/, "");
   }
-  // 2. Common nvm/volta paths from NODE_PATH / process.execPath
-  try {
-    const binDir = dirname(process.execPath); // .../bin
-    const libDir = join(dirname(binDir), "lib", "node_modules");
-    const candidate = join(libDir, "@earendil-works", "pi-coding-agent");
-    const imExists = existsSync(join(candidate, "dist", "modes", "interactive", "interactive-mode.js"));
-    if (imExists) return candidate;
-  } catch {
-    /* fall through */
-  }
-  return undefined;
-}
-
-const piRoot = resolveGlobalPiRoot();
+})();
 const imPath = piRoot
   ? join(piRoot, "dist", "modes", "interactive", "interactive-mode.js")
-  : undefined;
+  : "";
 
-// Use dynamic import() at session_start — NOT createRequire. pi runtime
-// imports this module as ESM. require() = separate CJS module registry =
-// separate prototype = patch lands on wrong object. import() shares pi's
-// ESM module instance.
 let InteractiveMode: (new (...args: unknown[]) => unknown) | undefined;
-
 let patched = false;
 
 interface GitPackage {
@@ -139,11 +77,25 @@ function patch(): void {
   };
   const original = proto.handleReloadCommand;
   if (typeof original !== "function") return;
-  // Guard against re-patching across reloads. jiti re-evaluates this module
-  // on every /reload (moduleCache:false), resetting the module-scoped
-  // `patched` flag. But the InteractiveMode prototype is shared (cached
-  // ESM instance), so without a marker we'd wrap N times after N reloads.
-  if ((original as any).__piPkgAutoreload) return;
+
+  // Resolve the TRUE original (pi's real handleReloadCommand).
+  // Cache it on globalThis once at first-ever install. Subsequent unwraps
+  // always resolve to the real ORIG, never a prior wrapper — prevents
+  // stacking a chain of wrappers that double-run git pulls.
+  const GLOBAL_ORIG = "__piPkgAutoreloadTrueOriginal";
+  let trueOriginal = original;
+  if ((original as any).__piPkgAutoreload) {
+    const cached = (globalThis as any)[GLOBAL_ORIG];
+    if (typeof cached === "function") {
+      trueOriginal = cached;
+    } else {
+      const stored = (original as any).__piPkgAutoreloadOriginal;
+      if (typeof stored === "function") trueOriginal = stored;
+    }
+  }
+  if (!(globalThis as any)[GLOBAL_ORIG]) {
+    (globalThis as any)[GLOBAL_ORIG] = trueOriginal;
+  }
 
   // Spawn git pull non-blocking with hard timeout. execSync blocks TUI render
   // loop; a single hung repo (auth prompt, network) freezes pi indefinitely.
@@ -185,88 +137,68 @@ function patch(): void {
     showStatus?: (msg: string) => void;
     sessionManager?: { getCwd?: () => string };
     session?: { modelRegistry?: unknown };
-    ui?: { setWidget?: (key: string, content: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }) => void };
   }) {
+    // Enable-token: consumed on each /reload. If autoreload wasn't loaded
+    // this cycle (removed from packages), passthrough to true reload.
+    const FLAG = "__piPkgAutoreloadEnabled";
+    const enabled = (globalThis as any)[FLAG] === true;
+    (globalThis as any)[FLAG] = false;
+    if (!enabled) return trueOriginal.call(this);
+
     const cwd = this.sessionManager?.getCwd?.() ?? process.cwd();
     const packages = collectGitPackages(cwd);
     if (packages.length === 0) {
-      return original.call(this);
+      return trueOriginal.call(this);
     }
 
-    const WIDGET_KEY = "pkg-autoreload";
-    const renderWidget = (statusByPkg: { source: string; state: "pending" | "pulling" | "done" | "failed"; msg?: string }[]) => {
-      try {
-        const lines = statusByPkg.map(p => {
-          const name = p.source.replace(/^git:/, "");
-          const icon = p.state === "done" ? "✓" : p.state === "failed" ? "✗" : p.state === "pulling" ? "⏳" : "·";
-          const detail = p.msg ? ` ${p.msg}` : "";
-          return `${icon} ${name}${detail}`;
-        });
-        this.ui?.setWidget?.(WIDGET_KEY, lines, { placement: "belowEditor" });
-      } catch {
-        /* best-effort */
-      }
-    };
-    const clearWidget = () => {
-      try {
-        this.ui?.setWidget?.(WIDGET_KEY, undefined);
-      } catch {
-        /* best-effort */
-      }
-    };
-
-    // Bounded parallel: 6 concurrent pulls. Serial wastes network idle time;
-    // unbounded floods connections.
-    const CONCURRENCY = 6;
-    const statusByPkg = packages.map(p => ({ source: p.source, state: "pending" as "pending" | "pulling" | "done" | "failed", msg: undefined as string | undefined }));
+    // Tiny repos, network cheap — pull all in parallel.
+    const CONCURRENCY = Math.max(8, packages.length);
     let updated = 0;
     let failed = 0;
     const failures: string[] = [];
     let idx = 0;
-    renderWidget(statusByPkg);
     const worker = async () => {
       while (idx < packages.length) {
         const localIdx = idx++;
         if (localIdx >= packages.length) break;
         const pkg = packages[localIdx];
         if (!pkg) break;
-        statusByPkg[localIdx].state = "pulling";
-        renderWidget(statusByPkg);
         const result = await pullPkg(pkg);
         if (result.ok) {
           updated++;
-          statusByPkg[localIdx].state = "done";
         } else {
           failed++;
-          statusByPkg[localIdx].state = "failed";
-          statusByPkg[localIdx].msg = result.msg;
           failures.push(`${pkg.source}: ${result.msg}`);
         }
-        renderWidget(statusByPkg);
       }
     };
+
     try {
       this.showStatus?.(`autoreload: pulling ${packages.length} packages…`);
     } catch {
       /* swallow */
     }
-    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, packages.length) }, () => worker()));
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, packages.length) }, () => worker()),
+    );
 
     try {
-      const summary = `autoreload: ${updated} updated, ${failed} failed`;
+      const summary = `autoreload: ${updated} updated${failed > 0 ? `, ${failed} failed` : ""}`;
       this.showStatus?.(failed > 0 ? `${summary} — ${failures.join("; ")}` : summary);
     } catch {
       /* swallow */
     }
-    clearWidget();
     // Now reload as normal — files on disk include any pulled updates.
-    return original.call(this);
+    return trueOriginal.call(this);
   };
   (proto.handleReloadCommand as any).__piPkgAutoreload = true;
+  (proto.handleReloadCommand as any).__piPkgAutoreloadOriginal = trueOriginal;
   patched = true;
 }
 
 export default function (pi: ExtensionAPI) {
+  // Re-arm the enable token. Consumed by the wrapper on next /reload.
+  (globalThis as any)["__piPkgAutoreloadEnabled"] = true;
   pi.on("session_start", async () => {
     if (!InteractiveMode && imPath) {
       try {
@@ -274,7 +206,7 @@ export default function (pi: ExtensionAPI) {
           InteractiveMode?: new (...args: unknown[]) => unknown;
         };
         InteractiveMode = mod.InteractiveMode;
-      } catch (err) {
+      } catch {
         // import failed — leave InteractiveMode undefined, patch() no-ops
       }
     }
