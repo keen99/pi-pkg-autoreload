@@ -185,6 +185,7 @@ function patch(): void {
     showStatus?: (msg: string) => void;
     sessionManager?: { getCwd?: () => string };
     session?: { modelRegistry?: unknown };
+    ui?: { setWidget?: (key: string, content: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }) => void };
   }) {
     const cwd = this.sessionManager?.getCwd?.() ?? process.cwd();
     const packages = collectGitPackages(cwd);
@@ -192,31 +193,56 @@ function patch(): void {
       return original.call(this);
     }
 
+    const WIDGET_KEY = "pkg-autoreload";
+    const renderWidget = (statusByPkg: { source: string; state: "pending" | "pulling" | "done" | "failed"; msg?: string }[]) => {
+      try {
+        const lines = statusByPkg.map(p => {
+          const name = p.source.replace(/^git:/, "");
+          const icon = p.state === "done" ? "✓" : p.state === "failed" ? "✗" : p.state === "pulling" ? "⏳" : "·";
+          const detail = p.msg ? ` ${p.msg}` : "";
+          return `${icon} ${name}${detail}`;
+        });
+        this.ui?.setWidget?.(WIDGET_KEY, lines, { placement: "belowEditor" });
+      } catch {
+        /* best-effort */
+      }
+    };
+    const clearWidget = () => {
+      try {
+        this.ui?.setWidget?.(WIDGET_KEY, undefined);
+      } catch {
+        /* best-effort */
+      }
+    };
+
     // Bounded parallel: 6 concurrent pulls. Serial wastes network idle time;
     // unbounded floods connections.
     const CONCURRENCY = 6;
-    let done = 0;
+    const statusByPkg = packages.map(p => ({ source: p.source, state: "pending" as "pending" | "pulling" | "done" | "failed", msg: undefined as string | undefined }));
     let updated = 0;
     let failed = 0;
     const failures: string[] = [];
     let idx = 0;
+    renderWidget(statusByPkg);
     const worker = async () => {
       while (idx < packages.length) {
-        const pkg = packages[idx++];
+        const localIdx = idx++;
+        if (localIdx >= packages.length) break;
+        const pkg = packages[localIdx];
         if (!pkg) break;
+        statusByPkg[localIdx].state = "pulling";
+        renderWidget(statusByPkg);
         const result = await pullPkg(pkg);
-        done++;
         if (result.ok) {
           updated++;
+          statusByPkg[localIdx].state = "done";
         } else {
           failed++;
+          statusByPkg[localIdx].state = "failed";
+          statusByPkg[localIdx].msg = result.msg;
           failures.push(`${pkg.source}: ${result.msg}`);
         }
-        try {
-          this.showStatus?.(`autoreload: ${done}/${packages.length} (${updated} up, ${failed} fail)`);
-        } catch {
-          /* swallow */
-        }
+        renderWidget(statusByPkg);
       }
     };
     try {
@@ -232,6 +258,7 @@ function patch(): void {
     } catch {
       /* swallow */
     }
+    clearWidget();
     // Now reload as normal — files on disk include any pulled updates.
     return original.call(this);
   };
