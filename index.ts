@@ -69,9 +69,11 @@ function collectGitPackages(cwd: string): GitPackage[] {
 
       // git:github.com/owner/repo -> owner/repo
       const rest = src.slice("git:".length);
-      // strip ref/query suffixes
-      const path = rest.replace(/[?#].*$/, "").replace(/^([^/]+\/[^/]+)@.*$/, "$1");
-      const dir = join(GIT_PKGS_DIR, path);
+      // strip query suffixes
+      const pathNoQuery = rest.replace(/[?#].*$/, "");
+      // pinned ref? skip (owner/repo@v1 = frozen intentionally)
+      if (/^[^/]+\/[^/]+@/.test(pathNoQuery)) continue;
+      const dir = join(GIT_PKGS_DIR, pathNoQuery);
       if (!existsSync(join(dir, ".git"))) continue;
       if (seen.has(dir)) continue;
       seen.add(dir);
