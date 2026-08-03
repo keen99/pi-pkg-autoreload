@@ -1,4 +1,4 @@
-import { readFileSync, existsSync, appendFileSync, mkdirSync, readdirSync, statSync, rmSync } from "node:fs";
+import { readFileSync, existsSync, appendFileSync, mkdirSync, readdirSync, statSync, rmSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -8,9 +8,17 @@ const GIT_PKGS_DIR = join(AGENT_DIR, "git");
 const LOG_DIR = join(AGENT_DIR, "pi-pkg-autoreload");
 const LOG_FILE = join(LOG_DIR, "debug.log");
 
+const LOG_MAX_BYTES = 512 * 1024; // 512 KB, rotate to .old
+
 function log(msg: string): void {
   try {
     mkdirSync(LOG_DIR, { recursive: true });
+    try {
+      if (statSync(LOG_FILE).size > LOG_MAX_BYTES) {
+        try { rmSync(`${LOG_FILE}.old`, { force: true }); } catch { /* ignore */ }
+        try { renameSync(LOG_FILE, `${LOG_FILE}.old`); } catch { /* ignore */ }
+      }
+    } catch { /* no file yet */ }
     const ts = new Date().toISOString();
     appendFileSync(LOG_FILE, `[${ts}] ${msg}\n`);
   } catch { /* ignore */ }
@@ -264,7 +272,18 @@ function patch(): void {
   const pullPkg = (pkg: GitPackage): Promise<{ ok: boolean; msg: string }> =>
     new Promise((resolve) => {
       const { spawn } = require("child_process") as typeof import("child_process");
-      const child = spawn("git fetch origin && git reset --hard @{u}", {
+      // Normalize origin URL: ensure .git suffix on github SSH/HTTPS remotes.
+      // pi cloned some repos without .git, breaking fetch.
+      const fixRemote =
+        "current=$(git remote get-url origin 2>/dev/null) || exit 1; " +
+        "case \"$current\" in " +
+        "  *github.com*:*.git|*github.com*/*.git) ;; " +
+        "  git@github.com:*) fixed=\"${current}.git\";; " +
+        "  https://github.com/*|http://github.com/*) fixed=\"${current}.git\";; " +
+        "  *) fixed=\"$current\";; " +
+        "esac; " +
+        "[ -n \"$fixed\" ] && [ \"$fixed\" != \"$current\" ] && git remote set-url origin \"$fixed\" || true; ";
+      const child = spawn(fixRemote + "git fetch origin && git reset --hard @{u}", {
         cwd: pkg.dir,
         stdio: ["ignore", "pipe", "pipe"],
         shell: true,
@@ -308,7 +327,7 @@ function patch(): void {
           cwd: NPM_INSTALL_DIR,
           stdio: ["ignore", "pipe", "pipe"],
           shell: true,
-          env: { ...process.env, CI: "1" },
+          env: { ...process.env, CI: "1", NPM_WRAPPER_ALLOW_LOCAL: "1" },
         },
       );
       let stderr = "";
@@ -395,7 +414,7 @@ function patch(): void {
         const { spawn } = require("child_process") as typeof import("child_process");
         const child = spawn(
           `npm uninstall ${name} --silent --no-audit --no-fund`,
-          { cwd: NPM_INSTALL_DIR, stdio: ["ignore", "pipe", "pipe"], shell: true, env: { ...process.env, CI: "1" } },
+          { cwd: NPM_INSTALL_DIR, stdio: ["ignore", "pipe", "pipe"], shell: true, env: { ...process.env, CI: "1", NPM_WRAPPER_ALLOW_LOCAL: "1" } },
         );
         let stderr = "";
         child.stderr?.on("data", (d) => { stderr += d.toString(); });
