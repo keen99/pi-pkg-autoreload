@@ -168,7 +168,9 @@ function readSettingsSources(cwd: string): { npm: Set<string>; git: Set<string> 
           npm.add(atIdx === -1 ? rest : rest.slice(0, atIdx));
         } else if (src.startsWith("git:")) {
           const rest = src.slice("git:".length).replace(/[?#].*$/, "");
-          const path = rest.replace(/^([^/]+\/[^/]+)@.*$/, "$1");
+          // drop host: github.com/owner/repo -> owner/repo (also strip @ref)
+          const noHost = rest.replace(/^[^/]+\//, "");
+          const path = noHost.replace(/^([^/]+\/[^/]+)@.*$/, "$1");
           git.add(path);
         }
       }
