@@ -1,4 +1,4 @@
-import { readFileSync, existsSync, appendFileSync, mkdirSync } from "node:fs";
+import { readFileSync, existsSync, appendFileSync, mkdirSync, readdirSync, statSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -136,6 +136,100 @@ function collectNpmPackages(cwd: string): NpmPackage[] {
   return out;
 }
 
+interface StaleNpm { name: string; reason: string }
+interface StaleGit { dir: string; source: string; reason: string }
+
+/** Read all package sources from settings (user+project, packages+disabledpackages). */
+function readSettingsSources(cwd: string): { npm: Set<string>; git: Set<string> } {
+  const npm = new Set<string>();
+  const git = new Set<string>();
+  const files = [join(AGENT_DIR, "settings.json"), join(cwd, ".pi", "settings.json")];
+  for (const file of files) {
+    let raw: string;
+    try { raw = readFileSync(file, "utf-8"); } catch { continue; }
+    let s: { packages?: unknown[]; disabledpackages?: unknown[] };
+    try { s = JSON.parse(raw); } catch { continue; }
+    for (const list of [s.packages, s.disabledpackages]) {
+      if (!Array.isArray(list)) continue;
+      for (const pkg of list) {
+        const src = typeof pkg === "string" ? pkg : (pkg as { source?: string })?.source;
+        if (typeof src !== "string") continue;
+        if (src.startsWith("npm:")) {
+          const rest = src.slice("npm:".length);
+          const atIdx = rest.indexOf("@", 1);
+          npm.add(atIdx === -1 ? rest : rest.slice(0, atIdx));
+        } else if (src.startsWith("git:")) {
+          const rest = src.slice("git:".length).replace(/[?#].*$/, "");
+          const path = rest.replace(/^([^/]+\/[^/]+)@.*$/, "$1");
+          git.add(path);
+        }
+      }
+    }
+  }
+  return { npm, git };
+}
+
+/** Find npm pkgs installed as top-level deps but not in settings.
+ *  Protects transitive deps of active packages. */
+function findStaleNpm(cwd: string, activeNpm: Set<string>): StaleNpm[] {
+  const stale: StaleNpm[] = [];
+  const pkgFile = join(NPM_INSTALL_DIR, "package.json");
+  let raw: string;
+  try { raw = readFileSync(pkgFile, "utf-8"); } catch { return stale; }
+  let deps: Record<string, string>;
+  try { deps = (JSON.parse(raw) as { dependencies?: Record<string,string> }).dependencies ?? {}; }
+  catch { return stale; }
+
+  const required = new Set<string>();
+  for (const name of activeNpm) {
+    try {
+      const depPkg = JSON.parse(readFileSync(join(NPM_INSTALL_DIR, "node_modules", name, "package.json"), "utf-8")) as { dependencies?: Record<string,string> };
+      for (const d of Object.keys(depPkg.dependencies ?? {})) required.add(d);
+    } catch { /* missing, skip */ }
+  }
+
+  for (const name of Object.keys(deps)) {
+    if (activeNpm.has(name)) continue;
+    if (required.has(name)) { stale.push({ name, reason: "transitive dep" }); continue; }
+    stale.push({ name, reason: "not in settings" });
+  }
+  return stale;
+}
+
+/** Find git clones on disk but source removed from settings. */
+function findStaleGit(activeGit: Set<string>): StaleGit[] {
+  const stale: StaleGit[] = [];
+  const hosts = ["github.com", "gitlab.com", "bitbucket.org"];
+  for (const host of hosts) {
+    const hostDir = join(GIT_PKGS_DIR, host);
+    let owners: string[];
+    try { owners = readdirSync(hostDir); } catch { continue; }
+    for (const owner of owners) {
+      const ownerDir = join(hostDir, owner);
+      let repos: string[];
+      try { repos = readdirSync(ownerDir); } catch { continue; }
+      for (const repo of repos) {
+        const dir = join(ownerDir, repo);
+        try { if (!statSync(dir).isDirectory()) continue; } catch { continue; }
+        if (!existsSync(join(dir, ".git"))) continue;
+        const path = `${owner}/${repo}`;
+        if (activeGit.has(path)) continue;
+        stale.push({ dir, source: `${host}/${path}`, reason: "not in settings" });
+      }
+    }
+  }
+  return stale;
+}
+
+/** Check git working tree clean (no uncommitted changes). */
+function isGitDirty(dir: string): boolean {
+  try {
+    const { execSync } = require("child_process") as typeof import("child_process");
+    const out = execSync("git status --porcelain", { cwd: dir, stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } }).toString();
+    return out.trim().length > 0;
+  } catch { return true; } // assume dirty if check fails
+}
+
 function patch(): void {
   if (patched) { log("patch: already patched, skip"); return; }
   if (!InteractiveMode) { log("patch: no InteractiveMode, skip"); return; }
@@ -259,25 +353,29 @@ function patch(): void {
     const cwd = this.sessionManager?.getCwd?.() ?? process.cwd();
     const gitPackages = collectGitPackages(cwd);
     const npmPackages = collectNpmPackages(cwd);
-    log(`reload: collected ${gitPackages.length} git + ${npmPackages.length} npm`);
-    if (gitPackages.length === 0 && npmPackages.length === 0) {
-      log("reload: no packages, passthrough");
-      return trueOriginal.call(this);
-    }
 
-    type State = "pending" | "working" | "done" | "failed";
-    interface Row { source: string; kind: "git" | "npm"; state: State; msg?: string }
+    // Cleanup phase: detect stale installs (not in settings, not transitive dep).
+    const settingsSrc = readSettingsSources(cwd);
+    const staleNpm = findStaleNpm(cwd, settingsSrc.npm);
+    const staleGit = findStaleGit(settingsSrc.git);
+    log(`reload: cleanup scan — ${staleNpm.length} stale npm, ${staleGit.length} stale git`);
+
+    type State = "pending" | "working" | "done" | "failed" | "skipped";
+    interface Row { source: string; kind: "clean" | "git" | "npm"; state: State; msg?: string }
     const WIDGET_KEY = "pkg-autoreload";
-    const rows: Row[] = [
-      ...gitPackages.map(p => ({ source: p.source, kind: "git" as const, state: "pending" as State })),
-      ...npmPackages.map(p => ({ source: p.source, kind: "npm" as const, state: "pending" as State })),
-    ];
+    const rows: Row[] = [];
+    // cleanup rows first
+    for (const s of staleNpm) rows.push({ source: s.name, kind: "clean", state: "pending", msg: s.reason });
+    for (const s of staleGit) rows.push({ source: s.source, kind: "clean", state: "pending", msg: s.reason });
+    // then update rows
+    rows.push(...gitPackages.map(p => ({ source: p.source, kind: "git" as const, state: "pending" as State })));
+    rows.push(...npmPackages.map(p => ({ source: p.source, kind: "npm" as const, state: "pending" as State })));
     const renderWidget = () => {
       try {
         const lines = rows.map(p => {
           const name = p.source.replace(/^(git:|npm:)/, "");
-          const tag = p.kind === "git" ? "git" : "npm";
-          const icon = p.state === "done" ? "✓" : p.state === "failed" ? "✗" : p.state === "working" ? "⏳" : "·";
+          const tag = p.kind === "git" ? "git" : p.kind === "npm" ? "npm" : "clean";
+          const icon = p.state === "done" ? "✓" : p.state === "failed" ? "✗" : p.state === "working" ? "⏳" : p.state === "skipped" ? "~" : "·";
           const detail = p.msg ? ` ${p.msg}` : "";
           return `${icon} ${name} ${tag}${detail}`;
         });
@@ -288,7 +386,68 @@ function patch(): void {
 
     let updated = 0;
     let failed = 0;
+    let cleaned = 0;
     const failures: string[] = [];
+
+    // Cleanup: npm uninstall stale, rm stale git clones (skip if dirty).
+    const cleanupNpmPkg = (name: string): Promise<{ ok: boolean; msg: string }> =>
+      new Promise((resolve) => {
+        const { spawn } = require("child_process") as typeof import("child_process");
+        const child = spawn(
+          `npm uninstall ${name} --silent --no-audit --no-fund`,
+          { cwd: NPM_INSTALL_DIR, stdio: ["ignore", "pipe", "pipe"], shell: true, env: { ...process.env, CI: "1" } },
+        );
+        let stderr = "";
+        child.stderr?.on("data", (d) => { stderr += d.toString(); });
+        let done = false;
+        const timer = setTimeout(() => {
+          if (done) return;
+          done = true;
+          child.kill("SIGKILL");
+          resolve({ ok: false, msg: "timeout (60s)" });
+        }, 60_000);
+        child.on("error", (err) => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          resolve({ ok: false, msg: err.message });
+        });
+        child.on("close", (code) => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          if (code === 0) resolve({ ok: true, msg: "" });
+          else resolve({ ok: false, msg: stderr.trim() || `exit ${code}` });
+        });
+      });
+
+    // Run cleanup serially (npm lock-safe, git rm quick).
+    let rowIdx = 0;
+    for (const s of staleNpm) {
+      const ri = rowIdx++;
+      rows[ri].state = "working";
+      renderWidget();
+      log(`cleanup npm uninstall ${s.name} (${s.reason})`);
+      const r = await cleanupNpmPkg(s.name);
+      if (r.ok) { cleaned++; rows[ri].state = "done"; }
+      else { failed++; rows[ri].state = "failed"; rows[ri].msg = r.msg; failures.push(`npm ${s.name}: ${r.msg}`); }
+      renderWidget();
+    }
+    for (const s of staleGit) {
+      const ri = rowIdx++;
+      if (isGitDirty(s.dir)) {
+        rows[ri].state = "skipped"; rows[ri].msg = "dirty, keep";
+        log(`cleanup git skip ${s.source} (dirty)`);
+        renderWidget();
+        continue;
+      }
+      rows[ri].state = "working";
+      renderWidget();
+      log(`cleanup git rm ${s.source}`);
+      try { rmSync(s.dir, { recursive: true, force: true }); cleaned++; rows[ri].state = "done"; }
+      catch (err) { failed++; rows[ri].state = "failed"; rows[ri].msg = (err as Error).message; failures.push(`git ${s.source}: ${(err as Error).message}`); }
+      renderWidget();
+    }
 
     // Git: parallel, tiny repos.
     let gitIdx = 0;
@@ -340,7 +499,8 @@ function patch(): void {
 
     try {
       const total = gitPackages.length + npmPackages.length;
-      const summary = `autoreload: ${updated}/${total} ok${failed > 0 ? `, ${failed} failed` : ""}`;
+      const cleanPart = cleaned > 0 ? `, ${cleaned} cleaned` : "";
+      const summary = `autoreload: ${updated}/${total} updated${cleanPart}${failed > 0 ? `, ${failed} failed` : ""}`;
       log(`reload complete: ${summary}`);
       this.showStatus?.(failed > 0 ? `${summary} — ${failures.join("; ")}` : summary);
     } catch {
