@@ -47,6 +47,24 @@ interface GitPackage {
   dir: string; // ~/.pi/agent/git/<owner>/<repo>
 }
 
+/** Normalize a git: source to "owner/repo" or undefined.
+ *  Handles github.com/owner/repo, git@github.com:owner/repo,
+ *  ssh://git@github.com/owner/repo, https://github.com/owner/repo,
+ *  .git suffixes, and @ref pins. */
+function gitSourcePath(src: string): string | undefined {
+  const rest = src.replace(/^git:/, "").replace(/[?#].*$/, "");
+  let path = rest;
+  const scp = path.match(/^git@[^:]+:(.+)$/);
+  if (scp) path = scp[1];
+  else if (/^ssh:\/\/git@[^/]+\//.test(path)) path = path.replace(/^ssh:\/\/git@[^/]+\//, "");
+  else if (/^https?:\/\/[^/]+\//.test(path)) path = path.replace(/^https?:\/\/[^/]+\//, "");
+  else path = path.replace(/^[^/]+\//, "");
+  path = path.replace(/\.git$/, "");
+  path = path.replace(/^([^/]+\/[^/]+)@.*$/, "$1");
+  return /^[^/]+\/[^/]+$/.test(path) ? path : undefined;
+}
+export { gitSourcePath };
+
 /** Collect git package install dirs from settings.json (user + project). */
 function collectGitPackages(cwd: string): GitPackage[] {
   const out: GitPackage[] = [];
@@ -75,12 +93,11 @@ function collectGitPackages(cwd: string): GitPackage[] {
       const src = typeof pkg === "string" ? pkg : (pkg as { source?: string })?.source;
       if (typeof src !== "string" || !src.startsWith("git:")) continue;
 
-      // git:github.com/owner/repo -> owner/repo
-      const rest = src.slice("git:".length);
-      // strip query suffixes
-      const pathNoQuery = rest.replace(/[?#].*$/, "");
-      // pinned ref? skip (owner/repo@v1 = frozen intentionally)
-      if (/^[^/]+\/[^/]+@/.test(pathNoQuery)) continue;
+      // Normalize every form to owner/repo via gitSourcePath.
+      // Pinned refs (@ref) are frozen intentionally — skip pulls.
+      if (/^[^/]+\/[^/]+@/.test(src.slice("git:").replace(/[?#].*$/, ""))) continue;
+      const pathNoQuery = gitSourcePath(src);
+      if (!pathNoQuery) continue;
       const dir = join(GIT_PKGS_DIR, pathNoQuery);
       if (!existsSync(join(dir, ".git"))) continue;
       if (seen.has(dir)) continue;
@@ -167,11 +184,8 @@ function readSettingsSources(cwd: string): { npm: Set<string>; git: Set<string> 
           const atIdx = rest.indexOf("@", 1);
           npm.add(atIdx === -1 ? rest : rest.slice(0, atIdx));
         } else if (src.startsWith("git:")) {
-          const rest = src.slice("git:".length).replace(/[?#].*$/, "");
-          // drop host: github.com/owner/repo -> owner/repo (also strip @ref)
-          const noHost = rest.replace(/^[^/]+\//, "");
-          const path = noHost.replace(/^([^/]+\/[^/]+)@.*$/, "$1");
-          git.add(path);
+          const path = gitSourcePath(src);
+          if (path) git.add(path);
         }
       }
     }
