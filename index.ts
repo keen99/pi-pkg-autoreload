@@ -1,4 +1,4 @@
-import { readFileSync, existsSync, appendFileSync, mkdirSync, readdirSync, statSync, rmSync, renameSync } from "node:fs";
+import { readFileSync, existsSync, appendFileSync, mkdirSync, readdirSync, statSync, rmSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -7,6 +7,8 @@ const AGENT_DIR = join(homedir(), ".pi", "agent");
 const GIT_PKGS_DIR = join(AGENT_DIR, "git");
 const LOG_DIR = join(AGENT_DIR, "pi-pkg-autoreload");
 const LOG_FILE = join(LOG_DIR, "debug.log");
+/** Attention lines persisted for re-show after reload (widget dies with session). */
+const ATTENTION_FILE = join(LOG_DIR, "last-attention.json");
 
 const LOG_MAX_BYTES = 512 * 1024; // 512 KB, rotate to .old
 
@@ -552,7 +554,18 @@ function patch(): void {
 
     // Keep widget only when something needs attention (failures, dirty
     // skips). All-green run clears immediately — no residue noise.
+    // Reload tears down extension widgets, so attention lines are also
+    // persisted to disk and re-shown on the next session_start.
     const attentionRows = rows.filter(p => p.state === "failed" || p.state === "skipped");
+    try {
+      const lines = attentionRows.map(p => {
+        const name = p.source.replace(/^(git:|npm:)/, "");
+        const icon = p.state === "failed" ? "✗" : "~";
+        const detail = p.msg ? ` ${p.msg}` : "";
+        return `${icon} ${name}${detail}`;
+      });
+      writeFileSync(ATTENTION_FILE, JSON.stringify({ lines, at: new Date().toISOString() }), { mode: 0o600 });
+    } catch { /* best-effort */ }
     await new Promise(r => setTimeout(r, 800));
     try {
       if (attentionRows.length === 0) {
@@ -603,5 +616,15 @@ export default function (pi: ExtensionAPI) {
       }
     }
     patch();
+    // Re-show persisted attention lines from the previous reload. Reload
+    // rebuilds the TUI and drops extension widgets — this restores them.
+    try {
+      const raw = JSON.parse(readFileSync(ATTENTION_FILE, "utf8")) as { lines?: string[]; at?: string };
+      const lines = Array.isArray(raw.lines) ? raw.lines.filter((l) => typeof l === "string") : [];
+      if (lines.length > 0) {
+        const ageMin = raw.at ? Math.round((Date.now() - Date.parse(raw.at)) / 60000) : 0;
+        ctx.ui.setWidget("pkg-autoreload-attention", [`autoreload needs attention (${ageMin}m ago):`, ...lines]);
+      }
+    } catch { /* no file or bad json — nothing to show */ }
   });
 }
