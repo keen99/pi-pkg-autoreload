@@ -47,21 +47,36 @@ interface GitPackage {
   dir: string; // ~/.pi/agent/git/<owner>/<repo>
 }
 
-/** Normalize a git: source to "owner/repo" or undefined.
+/** Normalize a git: source to "host/owner/repo" or undefined.
  *  Handles github.com/owner/repo, git@github.com:owner/repo,
  *  ssh://git@github.com/owner/repo, https://github.com/owner/repo,
- *  .git suffixes, and @ref pins. */
+ *  .git suffixes, and @ref pins. Host kept — install dirs are
+ *  ~/.pi/agent/git/<host>/<owner>/<repo>. */
 function gitSourcePath(src: string): string | undefined {
   const rest = src.replace(/^git:/, "").replace(/[?#].*$/, "");
   let path = rest;
-  const scp = path.match(/^git@[^:]+:(.+)$/);
-  if (scp) path = scp[1];
-  else if (/^ssh:\/\/git@[^/]+\//.test(path)) path = path.replace(/^ssh:\/\/git@[^/]+\//, "");
-  else if (/^https?:\/\/[^/]+\//.test(path)) path = path.replace(/^https?:\/\/[^/]+\//, "");
-  else path = path.replace(/^[^/]+\//, "");
+  let host = "";
+  const scp = path.match(/^git@([^:]+):(.+)$/);
+  if (scp) {
+    host = scp[1];
+    path = scp[2];
+  } else if (/^ssh:\/\/git@([^/]+)\//.test(path)) {
+    host = path.match(/^ssh:\/\/git@([^/]+)\//)![1];
+    path = path.replace(/^ssh:\/\/git@[^/]+\//, "");
+  } else if (/^https?:\/\/([^/]+)\//.test(path)) {
+    host = path.match(/^https?:\/\/([^/]+)\//)![1];
+    path = path.replace(/^https?:\/\/[^/]+\//, "");
+  } else {
+    const short = path.match(/^([^/]+)\/(.+)$/);
+    if (short) {
+      host = short[1];
+      path = short[2];
+    }
+  }
   path = path.replace(/\.git$/, "");
   path = path.replace(/^([^/]+\/[^/]+)@.*$/, "$1");
-  return /^[^/]+\/[^/]+$/.test(path) ? path : undefined;
+  if (!host || !/^[^/]+\/[^/]+$/.test(path)) return undefined;
+  return `${host}/${path}`;
 }
 export { gitSourcePath };
 
@@ -186,8 +201,7 @@ function readSettingsSources(cwd: string): { npm: Set<string>; git: Set<string> 
         } else if (src.startsWith("git:")) {
           const path = gitSourcePath(src);
           if (path) git.add(path);
-        }
-      }
+        }      }
     }
   }
   return { npm, git };
@@ -236,21 +250,29 @@ function findStaleGit(activeGit: Set<string>): StaleGit[] {
         const dir = join(ownerDir, repo);
         try { if (!statSync(dir).isDirectory()) continue; } catch { continue; }
         if (!existsSync(join(dir, ".git"))) continue;
-        const path = `${owner}/${repo}`;
+        const path = `${host}/${owner}/${repo}`;
         if (activeGit.has(path)) continue;
-        stale.push({ dir, source: `${host}/${path}`, reason: "not in settings" });
+        stale.push({ dir, source: path, reason: "not in settings" });
       }
     }
   }
   return stale;
 }
 
-/** Check git working tree clean (no uncommitted changes). */
+/** Check git working tree has real modifications.
+ *  Pi npm-installs deps inside each git clone (node_modules, package-lock.json),
+ *  so untracked npm artifacts are normal state, not "dirty". Only tracked-file
+ *  changes (M/A/D/R lines) count — matching pi's own update behavior, which
+ *  reset --hard + clean -fdx and reinstalls. */
 function isGitDirty(dir: string): boolean {
   try {
     const { execSync } = require("child_process") as typeof import("child_process");
     const out = execSync("git status --porcelain", { cwd: dir, stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } }).toString();
-    return out.trim().length > 0;
+    // " M file" (worktree mod), "M  file" (staged), "A ", "D ", "R " modify
+    // tracked content. "??" lines are untracked (node_modules etc).
+    return out
+      .split("\n")
+      .some((line) => line.trim().length > 0 && !line.trim().startsWith("??"));
   } catch { return true; } // assume dirty if check fails
 }
 
@@ -414,7 +436,7 @@ function patch(): void {
           const detail = p.msg ? ` ${p.msg}` : "";
           return `${icon} ${name} ${tag}${detail}`;
         });
-        (this as any).ui?.setWidget?.(WIDGET_KEY, lines, { placement: "belowEditor" });
+        (this as any).setExtensionWidget?.(WIDGET_KEY, lines, { placement: "belowEditor" });
       } catch { /* best-effort */ }
     };
     renderWidget();
@@ -530,7 +552,7 @@ function patch(): void {
 
     // Keep widget briefly so user sees final state, then clear + reload.
     await new Promise(r => setTimeout(r, 800));
-    try { (this as any).ui?.setWidget?.(WIDGET_KEY, undefined); } catch { /* best-effort */ }
+    try { (this as any).setExtensionWidget?.(WIDGET_KEY, undefined); } catch { /* best-effort */ }
 
     try {
       const total = gitPackages.length + npmPackages.length;
