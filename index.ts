@@ -603,7 +603,7 @@ export default function (pi: ExtensionAPI) {
   // Re-arm the enable token. Consumed by the wrapper on next /reload.
   (globalThis as any)["__piPkgAutoreloadEnabled"] = true;
   log("default export: enable token armed");
-  pi.on("session_start", async () => {
+  pi.on("session_start", async (_event, ctx) => {
     log("session_start: attempting patch");
     if (!InteractiveMode && imPath) {
       try {
