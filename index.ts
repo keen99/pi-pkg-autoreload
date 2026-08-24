@@ -508,6 +508,13 @@ function patch(): void {
       renderWidget();
     }
 
+    // Row layout: [cleanup npm][cleanup git][git pulls][npm updates].
+    // All workers must index past the cleanup rows or they clobber them
+    // (failed/skipped cleanup rows got overwritten -> empty attention file).
+    const cleanupRowCount = staleNpm.length + staleGit.length;
+    const gitRowOffset = cleanupRowCount;
+    const npmRowOffset = cleanupRowCount + gitPackages.length;
+
     // Git: parallel, tiny repos.
     let gitIdx = 0;
     const gitWorker = async () => {
@@ -516,14 +523,15 @@ function patch(): void {
         if (i >= gitPackages.length) break;
         const pkg = gitPackages[i];
         if (!pkg) break;
-        rows[i].state = "working";
+        const ri = gitRowOffset + i;
+        rows[ri].state = "working";
         renderWidget();
         log(`pulling ${pkg.source} (${pkg.dir})`);
         const result = await pullPkg(pkg);
         log(`pull ${pkg.source}: ok=${result.ok} msg=${result.msg}`);
-        if (result.ok) { updated++; rows[i].state = "done"; }
+        if (result.ok) { updated++; rows[ri].state = "done"; }
         else {
-          failed++; rows[i].state = "failed"; rows[i].msg = result.msg;
+          failed++; rows[ri].state = "failed"; rows[ri].msg = result.msg;
           failures.push(`${pkg.source}: ${result.msg}`);
         }
         renderWidget();
@@ -535,7 +543,7 @@ function patch(): void {
 
     // npm: serial. npm CLI not safe to parallelize against same node_modules
     // (lock contention, ERESOLVE). One at a time, silent.
-    const npmOffset = gitPackages.length;
+    const npmOffset = cleanupRowCount + gitPackages.length;
     for (let i = 0; i < npmPackages.length; i++) {
       const pkg = npmPackages[i];
       const rowIdx = npmOffset + i;
