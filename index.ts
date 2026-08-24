@@ -550,9 +550,23 @@ function patch(): void {
       renderWidget();
     }
 
-    // Keep widget briefly so user sees final state, then clear + reload.
+    // Keep widget only when something needs attention (failures, dirty
+    // skips). All-green run clears immediately — no residue noise.
+    const attentionRows = rows.filter(p => p.state === "failed" || p.state === "skipped");
     await new Promise(r => setTimeout(r, 800));
-    try { (this as any).setExtensionWidget?.(WIDGET_KEY, undefined); } catch { /* best-effort */ }
+    try {
+      if (attentionRows.length === 0) {
+        (this as any).setExtensionWidget?.(WIDGET_KEY, undefined);
+      } else {
+        const lines = attentionRows.map(p => {
+          const name = p.source.replace(/^(git:|npm:)/, "");
+          const icon = p.state === "failed" ? "✗" : "~";
+          const detail = p.msg ? ` ${p.msg}` : "";
+          return `${icon} ${name}${detail}`;
+        });
+        (this as any).setExtensionWidget?.(WIDGET_KEY, lines, { placement: "belowEditor" });
+      }
+    } catch { /* best-effort */ }
 
     try {
       const total = gitPackages.length + npmPackages.length;
