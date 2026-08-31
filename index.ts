@@ -420,7 +420,7 @@ function patch(): void {
     log(`reload: cleanup scan — ${staleNpm.length} stale npm, ${staleGit.length} stale git`);
 
     type State = "pending" | "working" | "done" | "failed" | "skipped";
-    interface Row { source: string; kind: "clean" | "git" | "npm"; state: State; msg?: string }
+    interface Row { source: string; kind: "clean" | "git" | "npm"; state: State; msg?: string; since?: number }
     const rows: Row[] = [];
     const WIDGET_KEY = "pkg-autoreload";
     // cleanup rows first
@@ -430,19 +430,37 @@ function patch(): void {
     rows.push(...gitPackages.map(p => ({ source: p.source, kind: "git" as const, state: "pending" as State })));
     rows.push(...npmPackages.map(p => ({ source: p.source, kind: "npm" as const, state: "pending" as State })));
     // In-flight progress widget: transient, cleared when reload ends.
+    // Lag view — only unfinished packages render; done collapse into the
+    // header count. Working rows show elapsed seconds so slow pulls are
+    // visible at a glance. pi caps array widgets at 10 lines, so details
+    // clip at 8 rows with an overflow line: never truncated.
     const renderWidget = () => {
       try {
-        const lines = rows.map(p => {
+        const done = rows.filter(p => p.state === "done").length;
+        const working = rows.filter(p => p.state === "working");
+        const failedRows = rows.filter(p => p.state === "failed");
+        const skippedRows = rows.filter(p => p.state === "skipped");
+        const bits = [`${done}/${rows.length} done`];
+        if (working.length) bits.push(`${working.length} active`);
+        if (failedRows.length) bits.push(`${failedRows.length} failed`);
+        if (skippedRows.length) bits.push(`${skippedRows.length} skipped`);
+        const lines: string[] = [`⏳ autoreload: ${bits.join(", ")}`];
+        const active = [...working, ...failedRows, ...skippedRows];
+        for (const p of active.slice(0, 8)) {
           const name = p.source.replace(/^(git:|npm:)/, "");
-          const tag = p.kind === "git" ? "git" : p.kind === "npm" ? "npm" : "clean";
-          const icon = p.state === "done" ? "\u2713" : p.state === "failed" ? "\u2717" : p.state === "working" ? "\u23f3" : p.state === "skipped" ? "~" : "\u00b7";
-          const detail = p.msg ? ` ${p.msg}` : "";
-          return `${icon} ${name} ${tag}${detail}`;
-        });
+          const icon = p.state === "failed" ? "✗" : p.state === "working" ? "⏳" : "~";
+          const elapsed = p.state === "working" && p.since
+            ? ` ${Math.max(1, Math.round((Date.now() - p.since) / 1000))}s`
+            : "";
+          lines.push(`  ${icon} ${name}${elapsed}${p.msg ? ` — ${p.msg}` : ""}`);
+        }
+        if (active.length > 8) lines.push(`  +${active.length - 8} more`);
         (this as any).setExtensionWidget?.(WIDGET_KEY, lines, { placement: "belowEditor" });
       } catch { /* best-effort */ }
     };
     renderWidget();
+    // Tick elapsed seconds while rows are in flight.
+    const progressTimer = setInterval(renderWidget, 1000);
 
     let updated = 0;
     let failed = 0;
@@ -486,6 +504,7 @@ function patch(): void {
     for (const s of staleNpm) {
       const ri = rowIdx++;
       rows[ri].state = "working";
+      rows[ri].since = Date.now();
       renderWidget();
       log(`cleanup npm uninstall ${s.name} (${s.reason})`);
       const r = await cleanupNpmPkg(s.name);
@@ -502,6 +521,7 @@ function patch(): void {
         continue;
       }
       rows[ri].state = "working";
+      rows[ri].since = Date.now();
       renderWidget();
       log(`cleanup git rm ${s.source}`);
       try { rmSync(s.dir, { recursive: true, force: true }); cleaned++; rows[ri].state = "done"; }
@@ -526,6 +546,7 @@ function patch(): void {
         if (!pkg) break;
         const ri = gitRowOffset + i;
         rows[ri].state = "working";
+        rows[ri].since = Date.now();
         renderWidget();
         log(`pulling ${pkg.source} (${pkg.dir})`);
         const result = await pullPkg(pkg);
@@ -549,6 +570,7 @@ function patch(): void {
       const pkg = npmPackages[i];
       const rowIdx = npmOffset + i;
       rows[rowIdx].state = "working";
+      rows[rowIdx].since = Date.now();
       log(`npm update ${pkg.source}`);
       const result = await updateNpmPkg(pkg);
       log(`npm ${pkg.source}: ok=${result.ok} msg=${result.msg}`);
@@ -559,7 +581,8 @@ function patch(): void {
       }
     }
 
-    // Progress done — clear the widget. Nothing sticky remains.
+    // Progress done — stop ticker, clear the widget. Nothing sticky remains.
+    clearInterval(progressTimer);
     try { (this as any).setExtensionWidget?.(WIDGET_KEY, undefined); } catch { /* best-effort */ }
 
     // Now reload as normal — files on disk include any pulled updates.
