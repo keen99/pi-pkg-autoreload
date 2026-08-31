@@ -1,4 +1,4 @@
-import { readFileSync, existsSync, appendFileSync, mkdirSync, readdirSync, statSync, rmSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync, existsSync, appendFileSync, mkdirSync, readdirSync, statSync, rmSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -7,8 +7,6 @@ const AGENT_DIR = join(homedir(), ".pi", "agent");
 const GIT_PKGS_DIR = join(AGENT_DIR, "git");
 const LOG_DIR = join(AGENT_DIR, "pi-pkg-autoreload");
 const LOG_FILE = join(LOG_DIR, "debug.log");
-/** Attention lines persisted for re-show after reload (widget dies with session). */
-const ATTENTION_FILE = join(LOG_DIR, "last-attention.json");
 
 const LOG_MAX_BYTES = 512 * 1024; // 512 KB, rotate to .old
 
@@ -398,6 +396,8 @@ function patch(): void {
 
   proto.handleReloadCommand = async function (this: {
     showStatus?: (msg: string) => void;
+    showError?: (msg: string) => void;
+    showWarning?: (msg: string) => void;
     sessionManager?: { getCwd?: () => string };
     session?: { modelRegistry?: unknown };
   }) {
@@ -421,20 +421,21 @@ function patch(): void {
 
     type State = "pending" | "working" | "done" | "failed" | "skipped";
     interface Row { source: string; kind: "clean" | "git" | "npm"; state: State; msg?: string }
-    const WIDGET_KEY = "pkg-autoreload";
     const rows: Row[] = [];
+    const WIDGET_KEY = "pkg-autoreload";
     // cleanup rows first
     for (const s of staleNpm) rows.push({ source: s.name, kind: "clean", state: "pending", msg: s.reason });
     for (const s of staleGit) rows.push({ source: s.source, kind: "clean", state: "pending", msg: s.reason });
     // then update rows
     rows.push(...gitPackages.map(p => ({ source: p.source, kind: "git" as const, state: "pending" as State })));
     rows.push(...npmPackages.map(p => ({ source: p.source, kind: "npm" as const, state: "pending" as State })));
+    // In-flight progress widget: transient, cleared when reload ends.
     const renderWidget = () => {
       try {
         const lines = rows.map(p => {
           const name = p.source.replace(/^(git:|npm:)/, "");
           const tag = p.kind === "git" ? "git" : p.kind === "npm" ? "npm" : "clean";
-          const icon = p.state === "done" ? "✓" : p.state === "failed" ? "✗" : p.state === "working" ? "⏳" : p.state === "skipped" ? "~" : "·";
+          const icon = p.state === "done" ? "\u2713" : p.state === "failed" ? "\u2717" : p.state === "working" ? "\u23f3" : p.state === "skipped" ? "~" : "\u00b7";
           const detail = p.msg ? ` ${p.msg}` : "";
           return `${icon} ${name} ${tag}${detail}`;
         });
@@ -496,8 +497,8 @@ function patch(): void {
       const ri = rowIdx++;
       if (isGitDirty(s.dir)) {
         rows[ri].state = "skipped"; rows[ri].msg = "dirty, keep";
-        log(`cleanup git skip ${s.source} (dirty)`);
         renderWidget();
+        log(`cleanup git skip ${s.source} (dirty)`);
         continue;
       }
       rows[ri].state = "working";
@@ -548,7 +549,6 @@ function patch(): void {
       const pkg = npmPackages[i];
       const rowIdx = npmOffset + i;
       rows[rowIdx].state = "working";
-      renderWidget();
       log(`npm update ${pkg.source}`);
       const result = await updateNpmPkg(pkg);
       log(`npm ${pkg.source}: ok=${result.ok} msg=${result.msg}`);
@@ -557,37 +557,28 @@ function patch(): void {
         failed++; rows[rowIdx].state = "failed"; rows[rowIdx].msg = result.msg;
         failures.push(`${pkg.source}: ${result.msg}`);
       }
-      renderWidget();
     }
 
-    // Keep widget only when something needs attention (failures, dirty
-    // skips). All-green run clears immediately — no residue noise.
-    // Reload tears down extension widgets, so attention lines are also
-    // persisted to disk and re-shown on the next session_start.
+    // Progress done — clear the widget. Nothing sticky remains.
+    try { (this as any).setExtensionWidget?.(WIDGET_KEY, undefined); } catch { /* best-effort */ }
+
+    // Now reload as normal — files on disk include any pulled updates.
+    const reloadResult = await trueOriginal.call(this);
+
+    // Surface results AFTER native reload: reload rebuilds the TUI, so
+    // anything printed earlier is wiped. ctx.ui.notify = the same output
+    // channel every other extension uses; lines land in scrollback and
+    // stay in history.
+    const ui = (globalThis as any).__piPkgAutoreloadUI as
+      | { notify: (msg: string, level?: string) => void }
+      | undefined;
     const attentionRows = rows.filter(p => p.state === "failed" || p.state === "skipped");
-    try {
-      const lines = attentionRows.map(p => {
-        const name = p.source.replace(/^(git:|npm:)/, "");
-        const icon = p.state === "failed" ? "✗" : "~";
-        const detail = p.msg ? ` ${p.msg}` : "";
-        return `${icon} ${name}${detail}`;
-      });
-      writeFileSync(ATTENTION_FILE, JSON.stringify({ lines, at: new Date().toISOString() }), { mode: 0o600 });
-    } catch { /* best-effort */ }
-    await new Promise(r => setTimeout(r, 800));
-    try {
-      if (attentionRows.length === 0) {
-        (this as any).setExtensionWidget?.(WIDGET_KEY, undefined);
-      } else {
-        const lines = attentionRows.map(p => {
-          const name = p.source.replace(/^(git:|npm:)/, "");
-          const icon = p.state === "failed" ? "✗" : "~";
-          const detail = p.msg ? ` ${p.msg}` : "";
-          return `${icon} ${name}${detail}`;
-        });
-        (this as any).setExtensionWidget?.(WIDGET_KEY, lines, { placement: "belowEditor" });
-      }
-    } catch { /* best-effort */ }
+    ui?.notify(`autoreload reload finished: ${updated}/${gitPackages.length + npmPackages.length} updated, ${attentionRows.length} need attention`, "info");
+    for (const p of attentionRows) {
+      const name = p.source.replace(/^(git:|npm:)/, "");
+      const text = `${name}${p.msg ? `: ${p.msg}` : ""}`;
+      ui?.notify(`autoreload ${p.state === "failed" ? "✗" : "~"} ${text}`, p.state === "failed" ? "error" : "warning");
+    }
 
     try {
       const total = gitPackages.length + npmPackages.length;
@@ -598,8 +589,7 @@ function patch(): void {
     } catch {
       /* swallow */
     }
-    // Now reload as normal — files on disk include any pulled updates.
-    return trueOriginal.call(this);
+    return reloadResult;
   };
   (proto.handleReloadCommand as any).__piPkgAutoreload = true;
   (proto.handleReloadCommand as any).__piPkgAutoreloadOriginal = trueOriginal;
@@ -612,6 +602,10 @@ export default function (pi: ExtensionAPI) {
   (globalThis as any)["__piPkgAutoreloadEnabled"] = true;
   log("default export: enable token armed");
   pi.on("session_start", async (_event, ctx) => {
+    // Blessed output channel: same ctx.ui.notify every other extension uses.
+    // Stashed on globalThis so the /reload wrapper (patched on InteractiveMode,
+    // no ctx of its own) can print into scrollback after module reloads.
+    (globalThis as any).__piPkgAutoreloadUI = ctx.ui;
     log("session_start: attempting patch");
     if (!InteractiveMode && imPath) {
       try {
@@ -624,15 +618,5 @@ export default function (pi: ExtensionAPI) {
       }
     }
     patch();
-    // Re-show persisted attention lines from the previous reload. Reload
-    // rebuilds the TUI and drops extension widgets — this restores them.
-    try {
-      const raw = JSON.parse(readFileSync(ATTENTION_FILE, "utf8")) as { lines?: string[]; at?: string };
-      const lines = Array.isArray(raw.lines) ? raw.lines.filter((l) => typeof l === "string") : [];
-      if (lines.length > 0) {
-        const ageMin = raw.at ? Math.round((Date.now() - Date.parse(raw.at)) / 60000) : 0;
-        ctx.ui.setWidget("pkg-autoreload-attention", [`autoreload needs attention (${ageMin}m ago):`, ...lines]);
-      }
-    } catch { /* no file or bad json — nothing to show */ }
   });
 }
