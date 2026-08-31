@@ -496,7 +496,7 @@ function patch(): void {
     for (const s of staleGit) {
       const ri = rowIdx++;
       if (isGitDirty(s.dir)) {
-        rows[ri].state = "skipped"; rows[ri].msg = "has uncommitted changes — left untouched, not updated";
+        rows[ri].state = "skipped"; rows[ri].msg = "dirty, not updated";
         renderWidget();
         log(`cleanup git skip ${s.source} (dirty)`);
         continue;
