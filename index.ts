@@ -7,6 +7,19 @@ const AGENT_DIR = join(homedir(), ".pi", "agent");
 const GIT_PKGS_DIR = join(AGENT_DIR, "git");
 const LOG_DIR = join(AGENT_DIR, "pi-pkg-autoreload");
 const LOG_FILE = join(LOG_DIR, "debug.log");
+// SSH multiplexing: one handshake for all parallel git fetches, socket under
+// the extension's own state dir (portable — never touches ~/.ssh/config).
+// Slow github handshakes (10s+) under 22 parallel fetches caused timeouts
+// and auth failures; a shared ControlMaster connection fixes both.
+const SSH_MUX_DIR = join(LOG_DIR, "sockets");
+try {
+  mkdirSync(SSH_MUX_DIR, { recursive: true });
+} catch {
+  /* best-effort */
+}
+const GIT_SSH_COMMAND =
+  `ssh -o ControlMaster=auto -o ControlPath=${SSH_MUX_DIR}/%r@%h-%p ` +
+  "-o ControlPersist=10m -o BatchMode=yes";
 
 const LOG_MAX_BYTES = 512 * 1024; // 512 KB, rotate to .old
 
@@ -310,6 +323,16 @@ function patch(): void {
   const pullPkg = (pkg: GitPackage): Promise<{ ok: boolean; msg: string }> =>
     new Promise((resolve) => {
       const { spawn } = require("child_process") as typeof import("child_process");
+      // Socket dir must exist before ssh binds — recreate cheaply every pull.
+      // If it can't be created, fall back to plain ssh (no muxing) instead of
+      // failing every fetch on an unbindable ControlPath.
+      let muxEnv: Record<string, string> = {};
+      try {
+        mkdirSync(SSH_MUX_DIR, { recursive: true });
+        muxEnv = { GIT_SSH_COMMAND: GIT_SSH_COMMAND };
+      } catch {
+        /* plain ssh */
+      }
       // Normalize origin URL: ensure .git suffix on github SSH/HTTPS remotes.
       // pi cloned some repos without .git, breaking fetch.
       const fixRemote =
@@ -325,7 +348,11 @@ function patch(): void {
         cwd: pkg.dir,
         stdio: ["ignore", "pipe", "pipe"],
         shell: true,
-        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+        env: {
+          ...process.env,
+          GIT_TERMINAL_PROMPT: "0",
+          ...muxEnv,
+        },
       });
       let stderr = "";
       child.stderr?.on("data", (d) => {
