@@ -1,0 +1,5 @@
+# Known-unfixable versions — excluded from install and smoke entirely.
+# 0.85.0: pi shipped interactive-mode.js with an undeclared dependency on
+# @earendil-works/pi-server, making the file unimportable (pi packaging
+# bug, fixed upstream in 0.85.1). No release/badge claim is possible.
+0.85.0

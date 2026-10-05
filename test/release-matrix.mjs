@@ -9,7 +9,7 @@
 //   PI_MATRIX="0.75.4,1.0.0" node test/release-matrix.mjs   # explicit list
 //   PI_MATRIX_INCLUDE_PRERELEASE=1 ...                  # also test rc/beta tags
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -61,7 +61,25 @@ function resolveVersions() {
 let failed = 0;
 const results = [];
 const versions = await resolveVersions();
+// Known-dead versions, one per line in test/matrix-skip.txt (# comments ok).
+// Skipped versions are excluded from results entirely: no install, no smoke,
+// and the tag-sync never sees them, so no release is published and the badge
+// cannot claim them. Use only for versions that are unfixably broken (e.g.
+// pi 0.85.0 shipped an unimportable interactive-mode.js).
+const skipFile = join(root, 'test', 'matrix-skip.txt');
+const skipped = new Set(
+  existsSync(skipFile)
+    ? readFileSync(skipFile, 'utf8')
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith('#'))
+    : [],
+);
 for (const version of versions) {
+  if (skipped.has(version)) {
+    console.log(`[matrix] ${version}: SKIP (matrix-skip.txt)`);
+    continue;
+  }
   const prefix = join(cacheRoot, version);
   const bin = join(prefix, 'node_modules', '.bin', 'pi');
   if (!existsSync(bin)) {
@@ -99,11 +117,12 @@ for (const version of versions) {
 mkdirSync(cacheRoot, { recursive: true });
 writeFileSync(join(cacheRoot, 'matrix-results.json'), `${JSON.stringify(results, null, 2)}\n`);
 
+const testedVersions = versions.filter((v) => !skipped.has(v));
 if (failed > 0) {
-  console.error(`[matrix] ${failed}/${versions.length} version(s) failed`);
+  console.error(`[matrix] ${failed}/${testedVersions.length} tested version(s) failed (${skipped.size} skipped)`);
   process.exit(1);
 }
 
 const newest = versions[versions.length - 1];
 writeFileSync(join(cacheRoot, '.latest-tested'), `${newest}\n`);
-console.log(`[matrix] all ${versions.length} version(s) pass (0.75.0 → ${newest})`);
+console.log(`[matrix] all ${testedVersions.length} tested version(s) pass (${skipped.size} skipped, 0.75.0 → ${newest})`);
