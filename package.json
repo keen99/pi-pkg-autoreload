@@ -21,7 +21,9 @@
   "scripts": {
     "clean": "echo 'nothing to clean'",
     "build": "echo 'nothing to build'",
-    "check": "echo 'nothing to check'"
+    "check": "echo 'nothing to check'",
+    "test": "node --import tsx --test test/unit.test.ts",
+    "test:matrix": "node test/release-matrix.mjs"
   },
   "pi": {
     "extensions": [
@@ -35,5 +37,8 @@
     "@earendil-works/pi-coding-agent": {
       "optional": true
     }
+  },
+  "devDependencies": {
+    "tsx": "^4.23.15"
   }
 }

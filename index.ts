@@ -1,56 +1,91 @@
 import { readFileSync, existsSync, appendFileSync, mkdirSync, readdirSync, statSync, rmSync, renameSync } from "node:fs";
+import { execSync, spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const AGENT_DIR = join(homedir(), ".pi", "agent");
-const GIT_PKGS_DIR = join(AGENT_DIR, "git");
-const LOG_DIR = join(AGENT_DIR, "pi-pkg-autoreload");
-const LOG_FILE = join(LOG_DIR, "debug.log");
+/** Resolve the pi agent dir per call. PI_CODING_AGENT_DIR wins so tests and
+ *  alternate installs can redirect state; otherwise the default ~/.pi/agent. */
+function agentDir(): string {
+  return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+}
+function GIT_PKGS_DIR(): string { return join(agentDir(), "git"); }
+function LOG_DIR(): string { return join(agentDir(), "pi-pkg-autoreload"); }
+function LOG_FILE(): string { return join(LOG_DIR(), "debug.log"); }
 // SSH multiplexing: one handshake for all parallel git fetches, socket under
 // the extension's own state dir (portable — never touches ~/.ssh/config).
 // Slow github handshakes (10s+) under 22 parallel fetches caused timeouts
 // and auth failures; a shared ControlMaster connection fixes both.
-const SSH_MUX_DIR = join(LOG_DIR, "sockets");
-try {
-  mkdirSync(SSH_MUX_DIR, { recursive: true });
-} catch {
-  /* best-effort */
+function SSH_MUX_DIR(): string { return join(LOG_DIR(), "sockets"); }
+function GIT_SSH_COMMAND(): string {
+  return (
+    `ssh -o ControlMaster=auto -o ControlPath=${SSH_MUX_DIR()}/%r@%h-%p ` +
+    "-o ControlPersist=10m -o BatchMode=yes"
+  );
 }
-const GIT_SSH_COMMAND =
-  `ssh -o ControlMaster=auto -o ControlPath=${SSH_MUX_DIR}/%r@%h-%p ` +
-  "-o ControlPersist=10m -o BatchMode=yes";
 
 const LOG_MAX_BYTES = 512 * 1024; // 512 KB, rotate to .old
 
 function log(msg: string): void {
   try {
-    mkdirSync(LOG_DIR, { recursive: true });
+    const logFile = LOG_FILE();
+    mkdirSync(LOG_DIR(), { recursive: true });
     try {
-      if (statSync(LOG_FILE).size > LOG_MAX_BYTES) {
-        try { rmSync(`${LOG_FILE}.old`, { force: true }); } catch { /* ignore */ }
-        try { renameSync(LOG_FILE, `${LOG_FILE}.old`); } catch { /* ignore */ }
+      if (statSync(logFile).size > LOG_MAX_BYTES) {
+        try { rmSync(`${logFile}.old`, { force: true }); } catch { /* ignore */ }
+        try { renameSync(logFile, `${logFile}.old`); } catch { /* ignore */ }
       }
     } catch { /* no file yet */ }
     const ts = new Date().toISOString();
-    appendFileSync(LOG_FILE, `[${ts}] ${msg}\n`);
+    appendFileSync(logFile, `[${ts}] ${msg}\n`);
   } catch { /* ignore */ }
 }
 
 log("=== ext module loaded ===");
 
-const piRoot = (function (): string {
+function piRoot(): string {
+  // 1. Harness/test override: the smoke knows the exact pi install it spawned.
+  if (process.env.PI_PKG_ROOT) return process.env.PI_PKG_ROOT;
+  // 2. Extension loaders that shim require with proper resolution (older pi).
   try {
     return require.resolve("@earendil-works/pi-coding-agent/package.json")
       .replace(/\/package\.json$/, "");
-  } catch {
-    const main = require.resolve("@earendil-works/pi-coding-agent");
-    return main.replace(/\/dist\/.*$/, "");
-  }
-})();
-const imPath = piRoot
-  ? join(piRoot, "dist", "modes", "interactive", "interactive-mode.js")
-  : "";
+  } catch { /* try the rest */ }
+  // 3. Real npm -g installs: derive the global node_modules root from the
+  //    running node binary (<prefix>/bin/node -> <prefix>/lib/node_modules).
+  //    Covers nvm and system node; worker threads share execPath.
+  try {
+    const execDir = dirname(realpathSync(process.execPath));
+    const globalRoot = join(execDir, "..", "lib", "node_modules");
+    return require.resolve("@earendil-works/pi-coding-agent/package.json", {
+      paths: [globalRoot],
+    }).replace(/\/package\.json$/, "");
+  } catch { /* try the rest */ }
+  // 4. Main-thread last resort: argv[1] is pi's entry script; walk up to the
+  //    package.json that declares the pi-coding-agent name.
+  try {
+    let dir = dirname(realpathSync(process.argv[1] ?? ""));
+    for (let i = 0; i < 12; i++) {
+      const pj = join(dir, "package.json");
+      try {
+        const name = (JSON.parse(readFileSync(pj, "utf-8")) as { name?: string }).name;
+        if (name === "@earendil-works/pi-coding-agent") return dir;
+      } catch { /* keep walking */ }
+      const up = dirname(dir);
+      if (up === dir) break;
+      dir = up;
+    }
+  } catch { /* argv[1] missing or unreadable */ }
+  return ""; // pi not resolvable from here — patch will no-op
+}
+
+function imPath(): string {
+  const root = piRoot();
+  return root
+    ? join(root, "dist", "modes", "interactive", "interactive-mode.js")
+    : "";
+}
 
 let InteractiveMode: (new (...args: unknown[]) => unknown) | undefined;
 let patched = false;
@@ -92,6 +127,7 @@ function gitSourcePath(src: string): string | undefined {
   return `${host}/${path}`;
 }
 export { gitSourcePath };
+export { collectGitPackages, collectNpmPackages, readSettingsSources, findStaleNpm, findStaleGit, isGitDirty };
 
 /** Collect git package install dirs from settings.json (user + project). */
 function collectGitPackages(cwd: string): GitPackage[] {
@@ -99,7 +135,7 @@ function collectGitPackages(cwd: string): GitPackage[] {
   const seen = new Set<string>();
 
   const settingsFiles = [
-    join(AGENT_DIR, "settings.json"),
+    join(agentDir(), "settings.json"),
     join(cwd, ".pi", "settings.json"),
   ];
 
@@ -123,10 +159,10 @@ function collectGitPackages(cwd: string): GitPackage[] {
 
       // Normalize every form to owner/repo via gitSourcePath.
       // Pinned refs (@ref) are frozen intentionally — skip pulls.
-      if (/^[^/]+\/[^/]+@/.test(src.slice("git:").replace(/[?#].*$/, ""))) continue;
+      if (/\/[^/@]+@[^/?#]*$/.test(src.slice("git:").replace(/[?#].*$/, ""))) continue;
       const pathNoQuery = gitSourcePath(src);
       if (!pathNoQuery) continue;
-      const dir = join(GIT_PKGS_DIR, pathNoQuery);
+      const dir = join(GIT_PKGS_DIR(), pathNoQuery);
       if (!existsSync(join(dir, ".git"))) continue;
       if (seen.has(dir)) continue;
       seen.add(dir);
@@ -136,7 +172,7 @@ function collectGitPackages(cwd: string): GitPackage[] {
   return out;
 }
 
-const NPM_INSTALL_DIR = join(AGENT_DIR, "npm");
+function NPM_INSTALL_DIR(): string { return join(agentDir(), "npm"); }
 
 interface NpmPackage {
   source: string; // full source string like "npm:@scope/pkg"
@@ -150,7 +186,7 @@ function collectNpmPackages(cwd: string): NpmPackage[] {
   const seen = new Set<string>();
 
   const settingsFiles = [
-    join(AGENT_DIR, "settings.json"),
+    join(agentDir(), "settings.json"),
     join(cwd, ".pi", "settings.json"),
   ];
 
@@ -180,7 +216,7 @@ function collectNpmPackages(cwd: string): NpmPackage[] {
       if (atIdx !== -1) continue; // version suffix present
 
       const name = rest;
-      if (!existsSync(join(NPM_INSTALL_DIR, "package.json"))) continue;
+      if (!existsSync(join(NPM_INSTALL_DIR(), "package.json"))) continue;
       if (seen.has(name)) continue;
       seen.add(name);
       out.push({ source: src, name });
@@ -196,7 +232,7 @@ interface StaleGit { dir: string; source: string; reason: string }
 function readSettingsSources(cwd: string): { npm: Set<string>; git: Set<string> } {
   const npm = new Set<string>();
   const git = new Set<string>();
-  const files = [join(AGENT_DIR, "settings.json"), join(cwd, ".pi", "settings.json")];
+  const files = [join(agentDir(), "settings.json"), join(cwd, ".pi", "settings.json")];
   for (const file of files) {
     let raw: string;
     try { raw = readFileSync(file, "utf-8"); } catch { continue; }
@@ -224,7 +260,7 @@ function readSettingsSources(cwd: string): { npm: Set<string>; git: Set<string> 
  *  Protects transitive deps of active packages. */
 function findStaleNpm(cwd: string, activeNpm: Set<string>): StaleNpm[] {
   const stale: StaleNpm[] = [];
-  const pkgFile = join(NPM_INSTALL_DIR, "package.json");
+  const pkgFile = join(NPM_INSTALL_DIR(), "package.json");
   let raw: string;
   try { raw = readFileSync(pkgFile, "utf-8"); } catch { return stale; }
   let deps: Record<string, string>;
@@ -234,14 +270,14 @@ function findStaleNpm(cwd: string, activeNpm: Set<string>): StaleNpm[] {
   const required = new Set<string>();
   for (const name of activeNpm) {
     try {
-      const depPkg = JSON.parse(readFileSync(join(NPM_INSTALL_DIR, "node_modules", name, "package.json"), "utf-8")) as { dependencies?: Record<string,string> };
+      const depPkg = JSON.parse(readFileSync(join(NPM_INSTALL_DIR(), "node_modules", name, "package.json"), "utf-8")) as { dependencies?: Record<string,string> };
       for (const d of Object.keys(depPkg.dependencies ?? {})) required.add(d);
     } catch { /* missing, skip */ }
   }
 
   for (const name of Object.keys(deps)) {
     if (activeNpm.has(name)) continue;
-    if (required.has(name)) { stale.push({ name, reason: "transitive dep" }); continue; }
+    if (required.has(name)) continue; // transitive dep of an active package — protected
     stale.push({ name, reason: "not in settings" });
   }
   return stale;
@@ -252,7 +288,7 @@ function findStaleGit(activeGit: Set<string>): StaleGit[] {
   const stale: StaleGit[] = [];
   const hosts = ["github.com", "gitlab.com", "bitbucket.org"];
   for (const host of hosts) {
-    const hostDir = join(GIT_PKGS_DIR, host);
+    const hostDir = join(GIT_PKGS_DIR(), host);
     let owners: string[];
     try { owners = readdirSync(hostDir); } catch { continue; }
     for (const owner of owners) {
@@ -279,7 +315,6 @@ function findStaleGit(activeGit: Set<string>): StaleGit[] {
  *  reset --hard + clean -fdx and reinstalls. */
 function isGitDirty(dir: string): boolean {
   try {
-    const { execSync } = require("child_process") as typeof import("child_process");
     const out = execSync("git status --porcelain", { cwd: dir, stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } }).toString();
     // " M file" (worktree mod), "M  file" (staged), "A ", "D ", "R " modify
     // tracked content. "??" lines are untracked (node_modules etc).
@@ -322,14 +357,13 @@ function patch(): void {
   // loop; a single hung repo (auth prompt, network) freezes pi indefinitely.
   const pullPkg = (pkg: GitPackage): Promise<{ ok: boolean; msg: string }> =>
     new Promise((resolve) => {
-      const { spawn } = require("child_process") as typeof import("child_process");
       // Socket dir must exist before ssh binds — recreate cheaply every pull.
       // If it can't be created, fall back to plain ssh (no muxing) instead of
       // failing every fetch on an unbindable ControlPath.
       let muxEnv: Record<string, string> = {};
       try {
         mkdirSync(SSH_MUX_DIR, { recursive: true });
-        muxEnv = { GIT_SSH_COMMAND: GIT_SSH_COMMAND };
+        muxEnv = { GIT_SSH_COMMAND: GIT_SSH_COMMAND() };
       } catch {
         /* plain ssh */
       }
@@ -385,11 +419,10 @@ function patch(): void {
   // --no-audit --no-fund kill npm noise. --silent suppresses install table.
   const updateNpmPkg = (pkg: NpmPackage): Promise<{ ok: boolean; msg: string }> =>
     new Promise((resolve) => {
-      const { spawn } = require("child_process") as typeof import("child_process");
       const child = spawn(
         `npm install ${pkg.name}@latest --no-audit --no-fund --silent --no-progress`,
         {
-          cwd: NPM_INSTALL_DIR,
+          cwd: NPM_INSTALL_DIR(),
           stdio: ["ignore", "pipe", "pipe"],
           shell: true,
           env: { ...process.env, CI: "1", NPM_WRAPPER_ALLOW_LOCAL: "1" },
@@ -497,8 +530,7 @@ function patch(): void {
     // Cleanup: npm uninstall stale, rm stale git clones (skip if dirty).
     const cleanupNpmPkg = (name: string): Promise<{ ok: boolean; msg: string }> =>
       new Promise((resolve) => {
-        const { spawn } = require("child_process") as typeof import("child_process");
-        const child = spawn(
+          const child = spawn(
           `npm uninstall ${name} --silent --no-audit --no-fund`,
           { cwd: NPM_INSTALL_DIR, stdio: ["ignore", "pipe", "pipe"], shell: true, env: { ...process.env, CI: "1", NPM_WRAPPER_ALLOW_LOCAL: "1" } },
         );
@@ -657,14 +689,36 @@ export default function (pi: ExtensionAPI) {
     // no ctx of its own) can print into scrollback after module reloads.
     (globalThis as any).__piPkgAutoreloadUI = ctx.ui;
     log("session_start: attempting patch");
-    if (!InteractiveMode && imPath) {
+    if (!InteractiveMode && imPath()) {
+      // Loader-dependent: under native ESM `import` gives named exports; under
+      // jiti/CJS interop the real module may sit on `.default`, and `require`
+      // may work where `import` throws. Try each, log every failure — silent
+      // no-op is how this extension rotted on pi >= 0.85.0.
+      const p = imPath();
       try {
-        const mod = (await import(imPath)) as {
+        const mod = (await import(p)) as {
           InteractiveMode?: new (...args: unknown[]) => unknown;
+          default?: { InteractiveMode?: new (...args: unknown[]) => unknown };
         };
-        InteractiveMode = mod.InteractiveMode;
-      } catch {
-        // import failed — leave InteractiveMode undefined, patch() no-ops
+        const im = mod.InteractiveMode ?? mod.default?.InteractiveMode;
+        if (typeof im === "function") {
+          InteractiveMode = im;
+        } else {
+          log(`import ok, no InteractiveMode (keys: ${Object.keys(mod).slice(0, 8).join(",")})`);
+        }
+      } catch (err) {
+        log(`import failed: ${(err as Error).message}`);
+        try {
+          const mod = require(p) as {
+            InteractiveMode?: new (...args: unknown[]) => unknown;
+            default?: { InteractiveMode?: new (...args: unknown[]) => unknown };
+          };
+          const im = mod.InteractiveMode ?? mod.default?.InteractiveMode;
+          if (typeof im === "function") InteractiveMode = im;
+          else log("require ok, no InteractiveMode");
+        } catch (err2) {
+          log(`require fallback failed: ${(err2 as Error).message}`);
+        }
       }
     }
     patch();

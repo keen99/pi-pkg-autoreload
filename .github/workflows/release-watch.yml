@@ -1,0 +1,38 @@
+name: release-watch
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - uses: actions/cache/restore@v4
+        with:
+          path: .matrix-cache
+          key: pi-matrix-${{ github.run_id }}
+          restore-keys: pi-matrix-
+      - run: npm run test:matrix
+      - name: Save matrix cache (always — installs must survive red runs)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .matrix-cache
+          key: pi-matrix-${{ github.run_id }}
+      - name: Sync tested tags
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node test/sync-tested-tags.mjs

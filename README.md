@@ -1,5 +1,9 @@
 # pi-pkg-autoreload
 
+![CI](https://github.com/keen99/pi-pkg-autoreload/actions/workflows/ci.yml/badge.svg)
+![release-watch](https://github.com/keen99/pi-pkg-autoreload/actions/workflows/release-watch.yml/badge.svg)
+[![pi tested](https://img.shields.io/github/v/release/keen99/pi-pkg-autoreload?label=pi%20tested%200.75.0%20%E2%86%92)](https://github.com/keen99/pi-pkg-autoreload/releases)
+
 Pi extension that makes `/reload` actually pick up remote changes for git packages.
 
 Zero config. Drop in, done.
@@ -50,3 +54,24 @@ Then `pi install` or restart pi.
 ## License
 
 MIT
+
+## Development
+
+`npm test` runs the unit suite; `npm run test:matrix` boots every
+stable pi release (>= 0.75.0) in RPC mode and asserts the
+`handleReloadCommand` patch actually installs on the real process
+(the extension's whole job — it silently no-ops if pi internals
+move, which is exactly what the matrix catches). Cached installs
+live in `.matrix-cache/`.
+
+Note: pi 0.85.0 is the one version the matrix cannot pass — that
+release shipped `interactive-mode.js` with an undeclared dependency
+on `@earendil-works/pi-server`, so the file cannot be imported at
+all (pi packaging bug, fixed in 0.85.1). The extension cannot patch
+on 0.85.0; the badge and releases reflect that honestly.
+
+Real bugs found and fixed while building the harness: pinned
+`git:host/owner/repo@ref` https-form packages were not detected as
+pinned and would be hard-reset to upstream; transitive deps of
+active npm packages were flagged stale and uninstalled; `isGitDirty`
+and the update spawns used `require()` which throws in ESM contexts.
